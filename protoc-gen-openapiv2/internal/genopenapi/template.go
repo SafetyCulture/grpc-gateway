@@ -22,6 +22,7 @@ import (
 	"github.com/grpc-ecosystem/grpc-gateway/v2/internal/descriptor"
 	openapi_options "github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-openapiv2/options"
 	"google.golang.org/genproto/googleapis/api/annotations"
+	"google.golang.org/genproto/googleapis/api/visibility"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/descriptorpb"
@@ -107,6 +108,9 @@ var wktSchemas = map[string]schemaCore{
 
 func listEnumNames(reg *descriptor.Registry, enum *descriptor.Enum) (names []string) {
 	for _, value := range enum.GetValue() {
+		if v, err := getEnumValueVisibilityOption(value); err == nil && !checkVisibility(v, reg) {
+			continue
+		}
 		if reg.GetOmitEnumDefaultValue() && value.GetNumber() == 0 {
 			continue
 		}
@@ -118,6 +122,9 @@ func listEnumNames(reg *descriptor.Registry, enum *descriptor.Enum) (names []str
 func listEnumNumbers(reg *descriptor.Registry, enum *descriptor.Enum) (numbers []string) {
 	for _, value := range enum.GetValue() {
 		if reg.GetOmitEnumDefaultValue() && value.GetNumber() == 0 {
+			continue
+		}
+		if v, err := getEnumValueVisibilityOption(value); err == nil && !checkVisibility(v, reg) {
 			continue
 		}
 		numbers = append(numbers, strconv.Itoa(int(value.GetNumber())))
@@ -139,6 +146,10 @@ func getEnumDefault(reg *descriptor.Registry, enum *descriptor.Enum) string {
 // messageToQueryParameters converts a message to a list of OpenAPI query parameters.
 func messageToQueryParameters(message *descriptor.Message, reg *descriptor.Registry, pathParams []descriptor.Parameter, body *descriptor.Body) (params []openapiParameterObject, err error) {
 	for _, field := range message.Fields {
+		if v, err := getFieldVisibilityOption(field); err == nil && !checkVisibility(v, reg) {
+			continue
+		}
+
 		p, err := queryParams(message, field, "", reg, pathParams, body, reg.GetRecursiveDepth())
 		if err != nil {
 			return nil, err
@@ -321,6 +332,10 @@ func nestedQueryParams(message *descriptor.Message, field *descriptor.Field, pre
 	touchedOut := cycle.Branch()
 
 	for _, nestedField := range msg.Fields {
+		if v, err := getFieldVisibilityOption(nestedField); err == nil && !checkVisibility(v, reg) {
+			continue
+		}
+
 		fieldName := reg.FieldName(field)
 		p, err := nestedQueryParams(msg, nestedField, prefix+fieldName+".", reg, pathParams, body, touchedOut)
 		if err != nil {
@@ -369,6 +384,10 @@ func findServicesMessagesAndEnumerations(s []*descriptor.Service, reg *descripto
 func findNestedMessagesAndEnumerations(message *descriptor.Message, reg *descriptor.Registry, m messageMap, e enumMap) {
 	// Iterate over all the fields that
 	for _, t := range message.Fields {
+		if v, err := getFieldVisibilityOption(t); err == nil && !checkVisibility(v, reg) {
+			continue
+		}
+
 		fieldType := t.GetTypeName()
 		// If the type is an empty string then it is a proto primitive
 		if fieldType != "" {
@@ -447,6 +466,10 @@ func renderMessageAsDefinition(msg *descriptor.Message, reg *descriptor.Registry
 	schema.Required = filterOutExcludedFields(schema.Required, pathParams)
 
 	for _, f := range msg.Fields {
+		if v, err := getFieldVisibilityOption(f); err == nil && !checkVisibility(v, reg) {
+			continue
+		}
+
 		if shouldExcludeField(f.GetName(), pathParams) {
 			continue
 		}
@@ -552,6 +575,26 @@ func renderMessagesAsDefinition(messages messageMap, d openapiDefinitionsObject,
 		}
 	}
 	return nil
+}
+
+func checkVisibility(r *visibility.VisibilityRule, reg *descriptor.Registry) bool {
+	if r == nil {
+		return true
+	}
+
+	restrictions := strings.Split(strings.TrimSpace(r.Restriction), ",")
+	// No restrictions results in the element always being visible
+	if len(restrictions) == 0 {
+		return true
+	}
+
+	for _, restriction := range restrictions {
+		if reg.GetVisibilityRestrictionSelectorsMap()[strings.TrimSpace(restriction)] {
+			return true
+		}
+	}
+
+	return false
 }
 
 func shouldExcludeField(name string, excluded []descriptor.Parameter) bool {
@@ -904,6 +947,9 @@ func partsToRegexpMap(parts []string) map[string]string {
 func renderServiceTags(services []*descriptor.Service, reg *descriptor.Registry) []openapiTagObject {
 	var tags []openapiTagObject
 	for _, svc := range services {
+		if v, err := getServiceVisibilityOption(svc); err == nil && !checkVisibility(v, reg) {
+			continue
+		}
 		tagName := svc.GetName()
 		if pkg := svc.File.GetPackage(); pkg != "" && reg.IsIncludePackageInTags() {
 			tagName = pkg + "." + tagName
@@ -942,7 +988,16 @@ func renderServices(services []*descriptor.Service, paths openapiPathsObject, re
 			lastFile = svc.File
 			svcBaseIdx = svcIdx
 		}
+
+		if v, err := getServiceVisibilityOption(svc); err == nil && !checkVisibility(v, reg) {
+			continue
+		}
+
 		for methIdx, meth := range svc.Methods {
+			if v, err := getMethodVisibilityOption(meth); err == nil && !checkVisibility(v, reg) {
+				continue
+			}
+
 			for bIdx, b := range meth.Bindings {
 				operationFunc := operationForMethod(b.HTTPMethod)
 				// Iterate over all the OpenAPI parameters
@@ -1997,6 +2052,9 @@ func enumValueProtoComments(reg *descriptor.Registry, enum *descriptor.Enum) str
 	protoPath := protoPathIndex(reflect.TypeOf((*descriptorpb.EnumDescriptorProto)(nil)), "Value")
 	var comments []string
 	for idx, value := range enum.GetValue() {
+		if v, err := getEnumValueVisibilityOption(value); err == nil && !checkVisibility(v, reg) {
+			continue
+		}
 		name := value.GetName()
 		if reg.GetEnumsAsInts() {
 			name = strconv.Itoa(int(value.GetNumber()))
@@ -2264,6 +2322,66 @@ func extractFieldBehaviorFromFieldDescriptor(fd *descriptorpb.FieldDescriptorPro
 	opts, ok := ext.([]annotations.FieldBehavior)
 	if !ok {
 		return nil, fmt.Errorf("extension is %T; want a []FieldBehavior object", ext)
+	}
+	return opts, nil
+}
+
+func getFieldVisibilityOption(fd *descriptor.Field) (*visibility.VisibilityRule, error) {
+	if fd.Options == nil {
+		return nil, nil
+	}
+	if !proto.HasExtension(fd.Options, visibility.E_FieldVisibility) {
+		return nil, nil
+	}
+	ext := proto.GetExtension(fd.Options, visibility.E_FieldVisibility)
+	opts, ok := ext.(*visibility.VisibilityRule)
+	if !ok {
+		return nil, fmt.Errorf("extension is %T; want a *VisibilityRule object", ext)
+	}
+	return opts, nil
+}
+
+func getServiceVisibilityOption(fd *descriptor.Service) (*visibility.VisibilityRule, error) {
+	if fd.Options == nil {
+		return nil, nil
+	}
+	if !proto.HasExtension(fd.Options, visibility.E_ApiVisibility) {
+		return nil, nil
+	}
+	ext := proto.GetExtension(fd.Options, visibility.E_ApiVisibility)
+	opts, ok := ext.(*visibility.VisibilityRule)
+	if !ok {
+		return nil, fmt.Errorf("extension is %T; want a *VisibilityRule object", ext)
+	}
+	return opts, nil
+}
+
+func getMethodVisibilityOption(fd *descriptor.Method) (*visibility.VisibilityRule, error) {
+	if fd.Options == nil {
+		return nil, nil
+	}
+	if !proto.HasExtension(fd.Options, visibility.E_MethodVisibility) {
+		return nil, nil
+	}
+	ext := proto.GetExtension(fd.Options, visibility.E_MethodVisibility)
+	opts, ok := ext.(*visibility.VisibilityRule)
+	if !ok {
+		return nil, fmt.Errorf("extension is %T; want a *VisibilityRule object", ext)
+	}
+	return opts, nil
+}
+
+func getEnumValueVisibilityOption(fd *descriptorpb.EnumValueDescriptorProto) (*visibility.VisibilityRule, error) {
+	if fd.Options == nil {
+		return nil, nil
+	}
+	if !proto.HasExtension(fd.Options, visibility.E_ValueVisibility) {
+		return nil, nil
+	}
+	ext := proto.GetExtension(fd.Options, visibility.E_ValueVisibility)
+	opts, ok := ext.(*visibility.VisibilityRule)
+	if !ok {
+		return nil, fmt.Errorf("extension is %T; want a *VisibilityRule object", ext)
 	}
 	return opts, nil
 }
